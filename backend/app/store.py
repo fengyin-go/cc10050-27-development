@@ -27,9 +27,11 @@ class Store:
                 return row
         return None
 
-    def overview(self) -> dict[str, object]:
+    def overview(self, only: set[str] | None = None) -> dict[str, object]:
         modules: list[dict[str, object]] = []
         for name in self.module_names():
+            if only is not None and name not in only:
+                continue
             rows = self.rows(name)
             modules.append({
                 "name": name,

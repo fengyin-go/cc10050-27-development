@@ -70,6 +70,9 @@
       </tbody>
     </table>
 
+    <SpecSyncPanel v-if="meta.key === 'spec_normalizer'" @changed="reload" />
+    <SkuMatchSyncPanel v-else-if="meta.key === 'sku_match'" @changed="reload" />
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
@@ -104,6 +107,8 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import SkuMatchSyncPanel from '@/views/SkuMatchSyncPanel.vue'
+import SpecSyncPanel from '@/views/SpecSyncPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)

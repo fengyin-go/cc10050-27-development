@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers import ROUTERS
+from app.services import SERVICES
 from app.store import store
 
 app = FastAPI(title="商品价格监控采集平台", version="1.0.0")
@@ -25,13 +26,17 @@ app.add_middleware(
 @app.get("/api/health")
 def health() -> dict[str, object]:
     """健康检查：确认服务已经监听、示例数据已经就绪。"""
-    return {"ok": True, "app": settings.app_name, "modules": len(store.module_names())}
+    return {"ok": True, "app": settings.app_name, "modules": len(SERVICES)}
 
 
 @app.get("/api/overview")
 def overview() -> dict[str, object]:
-    """运营概览：把各业务模块的待处理量汇总成看板卡片。"""
-    return store.overview()
+    """运营概览：把各业务模块的待处理量汇总成看板卡片。
+
+    只统计有领域服务的业务模块；spec_sync / spec_receipt 等内部交接表
+    通过 /api/spec-sync/... 暴露，不混进模块看板。
+    """
+    return store.overview(only=set(SERVICES))
 
 
 # 资源路由含 /api/{module}，必须放在 health / overview 之后注册，

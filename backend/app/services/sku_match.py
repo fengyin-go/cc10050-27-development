@@ -22,6 +22,211 @@ class SkuMatchService(BaseModuleService):
     ACTION_RULES = {"执行匹配": "已匹配", "转人工复核": "人工复核"}
     NEGATIVE_ACTIONS = []
 
+    # ---- 规格同步候选：候选实际取自同步数据，确认与撤回处理写回交接回执 ----
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _sync_rows() -> list[dict[str, Any]]:
+        return store.rows("spec_sync")
+
+    @staticmethod
+    def _receipt_rows() -> list[dict[str, Any]]:
+        return store.rows("spec_receipt")
+
+    def _find_batch(self, batch_id: int) -> dict[str, Any] | None:
+        for row in self._sync_rows():
+            if int(row.get("id", 0)) == batch_id:
+                return row
+        return None
+
+    def _receipt_for(self, batch_code: str) -> dict[str, Any] | None:
+        return next(
+            (r for r in self._receipt_rows() if r.get("同步批次") == batch_code), None
+        )
+
+    def _order_for(self, batch: dict[str, Any]) -> dict[str, Any] | None:
+        match_id = batch.get("匹配记录ID")
+        if match_id:
+            order = store.find(self.MODULE, int(match_id))
+            if order is not None:
+                return order
+        return next(
+            (r for r in store.rows(self.MODULE)
+             if r.get("同步批次") == batch.get("同步批次")), None
+        )
+
+    def sync_candidates(self) -> dict[str, Any]:
+        """候选规格实际取自规格同步数据（快照+规则版本），不按名称现查规则。"""
+        items = []
+        for batch in self._sync_rows():
+            if batch.get("同步状态") not in ("待匹配", "匹配中", "撤回中"):
+                continue
+            order = self._order_for(batch) or {}
+            items.append({
+                "同步批次ID": batch.get("id"),
+                "同步批次": batch.get("同步批次"),
+                "商品标识": batch.get("商品标识"),
+                "候选规格": batch.get("归一规格"),
+                "规则版本": batch.get("规则版本"),
+                "同步状态": batch.get("同步状态"),
+                "撤回原因": batch.get("撤回原因", ""),
+                "匹配记录ID": order.get("id"),
+                "匹配单状态": order.get("匹配状态", ""),
+                "资格": order.get("资格", ""),
+            })
+        return {"ok": True, "items": items, "total": len(items)}
+
+    def start_sync_match(self, batch_id: int) -> dict[str, Any]:
+        """开始匹配同步候选：待匹配 → 匹配中，重复开始不产生第二条记录。"""
+        batch = self._find_batch(batch_id)
+        if batch is None:
+            return {"ok": False, "message": f"同步批次 {batch_id} 不存在"}
+        state = str(batch.get("同步状态", ""))
+        if state == "匹配中":
+            return {"ok": True, "message": "该候选已在匹配中，重复开始不产生第二条记录", "batch": batch}
+        if state != "待匹配":
+            return {"ok": False, "message": f"当前状态 {state} 不能开始匹配", "batch": batch}
+        goods = str(batch.get("商品标识", ""))
+        if not any(g.get("商品标识") == goods for g in store.rows("goods_registry")):
+            return {"ok": False, "message": f"商品 {goods} 未登记，候选不可继续", "batch": batch}
+        now = self._now()
+        batch["同步状态"] = "匹配中"
+        batch["status"] = "匹配中"
+        batch["更新时间"] = now
+        order = self._order_for(batch)
+        if order is not None:
+            order["匹配状态"] = "匹配中"
+        receipt = self._receipt_for(str(batch.get("同步批次", "")))
+        if receipt is not None:
+            receipt["匹配方处理批次"] = batch.get("匹配批次", "")
+            receipt["匹配方处理结果"] = "匹配中"
+            receipt["更新时间"] = now
+        return {"ok": True, "message": f"候选 {batch.get('同步批次')} 开始匹配", "batch": batch}
+
+    def confirm_sync_match(self, batch_id: int) -> dict[str, Any]:
+        """写确认：同步批次转已确认，重复确认不产生相斥结果。"""
+        batch = self._find_batch(batch_id)
+        if batch is None:
+            return {"ok": False, "message": f"同步批次 {batch_id} 不存在"}
+        state = str(batch.get("同步状态", ""))
+        if state == "已确认":
+            return {"ok": True, "message": "确认已存在，重复提交不产生相斥确认结果", "batch": batch}
+        if state == "撤回中":
+            return {"ok": False, "message": "撤回处理中，请先处理撤回再决定是否确认", "batch": batch}
+        if state != "匹配中":
+            return {"ok": False, "message": f"当前状态 {state} 不能写确认，需先开始匹配", "batch": batch}
+        now = self._now()
+        batch["同步状态"] = "已确认"
+        batch["status"] = "已确认"
+        batch["确认时间"] = now
+        batch["更新时间"] = now
+        batch["pending"] = False
+        order = self._order_for(batch)
+        if order is not None:
+            order["status"] = "已匹配"
+            order["匹配状态"] = "已确认"
+            order["资格"] = "有效"
+            if not str(order.get("匹配置信度", "") or "").strip():
+                order["匹配置信度"] = "0.99"
+            order["pending"] = False
+        receipt = self._receipt_for(str(batch.get("同步批次", "")))
+        if receipt is not None:
+            receipt["匹配方处理批次"] = batch.get("匹配批次", "")
+            receipt["匹配方处理结果"] = "已确认"
+            receipt["旧成果可用性"] = "可用"
+            receipt["撤回待办"] = "无"
+            receipt["status"] = "已办结"
+            receipt["pending"] = False
+            receipt["更新时间"] = now
+        return {
+            "ok": True,
+            "message": (
+                f"批次 {batch.get('同步批次')} 已按 {batch.get('规则版本')}"
+                f"（{batch.get('归一规格')}）确认"
+            ),
+            "batch": batch,
+        }
+
+    def resolve_sync_withdrawal(self, batch_id: int, mode: str) -> dict[str, Any]:
+        """处理撤回：在途记录可用旧版处理完，或明示需用新版重做。"""
+        batch = self._find_batch(batch_id)
+        if batch is None:
+            return {"ok": False, "message": f"同步批次 {batch_id} 不存在"}
+        state = str(batch.get("同步状态", ""))
+        if state != "撤回中":
+            if state in ("已确认", "已撤回"):
+                return {"ok": True, "message": f"撤回已办结（{state}），重复处理不产生新结果", "batch": batch}
+            return {"ok": False, "message": f"当前状态 {state} 无需处理撤回", "batch": batch}
+        now = self._now()
+        order = self._order_for(batch)
+        receipt = self._receipt_for(str(batch.get("同步批次", "")))
+        if mode == "finish_old":
+            batch["同步状态"] = "已确认"
+            batch["status"] = "已确认"
+            batch["确认时间"] = now
+            batch["pending"] = False
+            if order is not None:
+                order["status"] = "已匹配"
+                order["匹配状态"] = "旧版办结"
+                order["资格"] = "有效"
+                if not str(order.get("匹配置信度", "") or "").strip():
+                    order["匹配置信度"] = "0.99"
+                order["pending"] = False
+            if receipt is not None:
+                receipt["匹配方处理结果"] = "旧版办结"
+                receipt["旧成果可用性"] = "可用"
+                receipt["撤回待办"] = "无"
+            message = f"在途记录已用旧版 {batch.get('规则版本')}（{batch.get('归一规格')}）处理完"
+        elif mode == "redo_new":
+            batch["同步状态"] = "已撤回"
+            batch["status"] = "已撤回"
+            batch["pending"] = False
+            if order is not None:
+                order["匹配状态"] = "需新版重做"
+                order["资格"] = "已撤回"
+                order["pending"] = False
+            if receipt is not None:
+                receipt["匹配方处理结果"] = "需新版重做"
+                receipt["旧成果可用性"] = "需重做"
+                receipt["撤回待办"] = "撤回已办结；需按当前规则版本重新发起同步"
+            message = "已明示需用新版重做，原同步撤回"
+        else:
+            return {"ok": False, "message": f"未知的撤回处理方式：{mode}"}
+        batch["更新时间"] = now
+        if receipt is not None:
+            receipt["匹配方处理批次"] = batch.get("匹配批次", "")
+            receipt["status"] = "已办结"
+            receipt["pending"] = False
+            receipt["更新时间"] = now
+        return {"ok": True, "message": message, "batch": batch, "receipt": receipt}
+
+    def confirmed_sync_history(self, keyword: str = "") -> dict[str, Any]:
+        """已确认历史匹配回查：保留资格与规则实用版本，不随规则更正回溯。"""
+        items = []
+        for batch in self._sync_rows():
+            if batch.get("同步状态") != "已确认":
+                continue
+            order = self._order_for(batch) or {}
+            items.append({
+                "同步批次": batch.get("同步批次"),
+                "商品标识": batch.get("商品标识"),
+                "归一规格": batch.get("归一规格"),
+                "规则版本": batch.get("规则版本"),
+                "资格": order.get("资格", "有效"),
+                "匹配单状态": order.get("匹配状态", ""),
+                "确认时间": batch.get("确认时间", ""),
+            })
+        if keyword:
+            items = [
+                item for item in items
+                if keyword.casefold() in str(item.get("同步批次", "")).casefold()
+                or keyword.casefold() in str(item.get("商品标识", "")).casefold()
+            ]
+        return {"ok": True, "items": items, "total": len(items)}
+
     # ---- 业务扩展：规格匹配与置信度分流 ----
 
     def run_match(self, entry_id: int, confidence: float) -> dict[str, Any]:
